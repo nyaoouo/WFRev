@@ -24,7 +24,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
-import java.util.Collections;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -35,8 +36,10 @@ public final class OfflineEntry extends Activity {
     private static final int PICK_COMIC = 3;
     private static final int COMIC_STORAGE_ACCESS = 4;
     private static final String COMIC_SETTINGS = "local.starpoint.COMIC_SETTINGS";
+    private static final String MULTIPLAYER_SETTINGS = "local.starpoint.MULTIPLAYER_SETTINGS";
     private static final String COMIC_SETUP_DONE = "comic-setup-done";
     private static final String COMIC_SHORTCUT = "starpoint-comic-settings";
+    private static final String MULTIPLAYER_SHORTCUT = "starpoint-multiplayer-settings";
     private static final long MAX_RUNTIME_BYTES = 256L * 1024 * 1024;
     private static final long START_TIMEOUT_MS = 240_000L;
     private static final String CDN_DOWNLOAD =
@@ -55,11 +58,17 @@ public final class OfflineEntry extends Activity {
     private Button comic;
     private Button clearComic;
     private Button comicAccess;
+    private Button multiplayer;
     private boolean showingComicSettings;
     private File pendingComic;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        if (MULTIPLAYER_SETTINGS.equals(getIntent().getAction())) {
+            openMultiplayerSettings();
+            finish();
+            return;
+        }
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         int padding = Math.round(20 * getResources().getDisplayMetrics().density);
@@ -98,6 +107,10 @@ public final class OfflineEntry extends Activity {
         comicAccess.setText("开启文件访问");
         comicAccess.setOnClickListener(view -> requestStorageAccess(COMIC_STORAGE_ACCESS));
         layout.addView(comicAccess);
+        multiplayer = new Button(this);
+        multiplayer.setText("联机设置");
+        multiplayer.setOnClickListener(view -> openMultiplayerSettings());
+        layout.addView(multiplayer);
         action = new Button(this);
         layout.addView(action);
         logPanel = new ScrollView(this);
@@ -109,7 +122,7 @@ public final class OfflineEntry extends Activity {
         layout.addView(logPanel, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(layout);
         logPanel.setVisibility(View.GONE);
-        installComicShortcut();
+        installSettingsShortcuts();
         if (state != null) {
             String pending = state.getString("pending-comic");
             pendingComic = pending == null ? null : new File(pending);
@@ -128,23 +141,34 @@ public final class OfflineEntry extends Activity {
         if (pendingComic != null) state.putString("pending-comic", pendingComic.getPath());
     }
 
-    private void installComicShortcut() {
+    private void openMultiplayerSettings() {
+        startActivity(new Intent(this, MultiplayerSettings.class));
+    }
+
+    private void installSettingsShortcuts() {
         if (Build.VERSION.SDK_INT < 25) return;
         ShortcutManager manager = getSystemService(ShortcutManager.class);
         if (manager == null) return;
         try {
-            for (ShortcutInfo entry : manager.getDynamicShortcuts()) {
-                if (COMIC_SHORTCUT.equals(entry.getId())) return;
-            }
-            Intent settings = new Intent(this, OfflineEntry.class).setAction(COMIC_SETTINGS);
-            manager.addDynamicShortcuts(Collections.singletonList(
-                    new ShortcutInfo.Builder(this, COMIC_SHORTCUT)
-                            .setShortLabel("漫画设置")
-                            .setIntent(settings)
-                            .build()));
+            List<ShortcutInfo> shortcuts = new ArrayList<>();
+            List<ShortcutInfo> existing = manager.getDynamicShortcuts();
+            addSettingsShortcut(shortcuts, existing, COMIC_SHORTCUT, COMIC_SETTINGS, "漫画设置");
+            addSettingsShortcut(shortcuts, existing, MULTIPLAYER_SHORTCUT, MULTIPLAYER_SETTINGS, "联机设置");
+            if (!shortcuts.isEmpty()) manager.addDynamicShortcuts(shortcuts);
         } catch (RuntimeException error) {
-            android.util.Log.w("StarPoint", "Unable to publish the comic settings shortcut", error);
+            android.util.Log.w("StarPoint", "Unable to publish settings shortcuts", error);
         }
+    }
+
+    private void addSettingsShortcut(List<ShortcutInfo> shortcuts, List<ShortcutInfo> existing,
+            String id, String action, String label) {
+        for (ShortcutInfo entry : existing) {
+            if (id.equals(entry.getId())) return;
+        }
+        shortcuts.add(new ShortcutInfo.Builder(this, id)
+                .setShortLabel(label)
+                .setIntent(new Intent(this, OfflineEntry.class).setAction(action))
+                .build());
     }
 
     private void pickDirectory(int request) {
@@ -204,6 +228,7 @@ public final class OfflineEntry extends Activity {
         comic.setOnClickListener(view -> showComicSettings(null));
         clearComic.setVisibility(View.GONE);
         comicAccess.setVisibility(View.GONE);
+        multiplayer.setVisibility(View.VISIBLE);
         action.setVisibility(View.GONE);
     }
 
@@ -228,6 +253,7 @@ public final class OfflineEntry extends Activity {
         comic.setOnClickListener(view -> pickDirectory(PICK_COMIC));
         clearComic.setVisibility(current == null ? View.GONE : View.VISIBLE);
         comicAccess.setVisibility(pendingComic == null ? View.GONE : View.VISIBLE);
+        multiplayer.setVisibility(View.VISIBLE);
         boolean shortcut = COMIC_SETTINGS.equals(getIntent().getAction());
         showAction(shortcut ? "关闭设置" : current == null ? "跳过并继续启动" : "继续启动", () -> {
             getSharedPreferences(CdnDirectory.PREFERENCES, MODE_PRIVATE).edit()
@@ -303,6 +329,7 @@ public final class OfflineEntry extends Activity {
         comic.setVisibility(View.GONE);
         clearComic.setVisibility(View.GONE);
         comicAccess.setVisibility(View.GONE);
+        multiplayer.setVisibility(View.GONE);
         action.setVisibility(View.GONE);
         updateStartup(started, getIntent().getBooleanExtra(BackendStartup.RESUME_GAME, false)
                 ? "正在恢复本地国服服务…" : "正在准备后端运行文件…", "");
@@ -373,7 +400,10 @@ public final class OfflineEntry extends Activity {
                 if (stage.exists()) removeTree(stage);
             }
         }
-        for (String name : new String[]{"payment-catalog.cjs", "payment-page.cjs", "local-payment.cjs", "start.cjs"}) {
+        for (String name : new String[]{"payment-catalog.cjs", "payment-page.cjs", "history-page.cjs",
+                "local-history.cjs", "quota-admin.cjs", "local-payment.cjs", "local-encyclopedia.cjs",
+                "team-content.cjs", "team-planner.cjs", "local-team-recommendations.cjs",
+                "local-coop-companions.cjs", "local-coop-requests.cjs", "local-hub-endpoint.cjs", "start.cjs"}) {
             File staged = new File(runtime, name + ".new");
             try (InputStream script = getAssets().open("starpoint/" + name)) {
                 Files.copy(script, staged.toPath(), StandardCopyOption.REPLACE_EXISTING);

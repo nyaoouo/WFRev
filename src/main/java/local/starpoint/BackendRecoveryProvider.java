@@ -14,6 +14,7 @@ import android.util.Log;
 public final class BackendRecoveryProvider extends ContentProvider
         implements Application.ActivityLifecycleCallbacks {
     private static final String GAME_ACTIVITY = "air.com.leiting.wf.AppEntry";
+    private final ReleaseUpdateCheck releaseUpdates = new ReleaseUpdateCheck();
     private Activity resumedGame;
     private int resumeGeneration;
 
@@ -25,6 +26,7 @@ public final class BackendRecoveryProvider extends ContentProvider
 
     @Override public void onActivityResumed(Activity activity) {
         if (!GAME_ACTIVITY.equals(activity.getComponentName().getClassName())) return;
+        releaseUpdates.onGameResumed(activity);
         resumedGame = activity;
         int generation = ++resumeGeneration;
         new Thread(() -> {
@@ -43,6 +45,7 @@ public final class BackendRecoveryProvider extends ContentProvider
     }
 
     @Override public void onActivityPaused(Activity activity) {
+        releaseUpdates.onGamePaused(activity);
         if (resumedGame == activity) resumedGame = null;
     }
 

@@ -23,10 +23,17 @@ public final class OfflineServer extends Service {
     private Thread worker;
     private File activeDirectory;
     private volatile String startupRequest;
+    private volatile boolean stopping;
+    private java.lang.Process nodeChild;
+    private boolean nativeStarted;
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && BackendStartup.STOP.equals(intent.getAction())) {
+            stopBackend(startId);
+            return START_NOT_STICKY;
+        }
         // The AIR activity and the backend run in separate processes.
         // Keep serving localhost even while the game or this service is not visible.
         NotificationManager notifications = getSystemService(NotificationManager.class);
@@ -36,11 +43,14 @@ public final class OfflineServer extends Service {
                 .addCategory(Intent.CATEGORY_BROWSABLE);
         PendingIntent openAdmin = PendingIntent.getActivity(this, 0, browser,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent openMultiplayer = PendingIntent.getActivity(this, 1,
+                new Intent(this, MultiplayerSettings.class), PendingIntent.FLAG_IMMUTABLE);
         startForeground(NOTIFICATION_ID, new Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
                 .setContentTitle("世界弹射物语")
                 .setContentText("本地国服服务运行中，点此打开管理后台")
                 .setContentIntent(openAdmin)
+                .addAction(new Notification.Action.Builder(null, "联机设置", openMultiplayer).build())
                 .setOngoing(true)
                 .build());
         String location = intent == null ? CdnDirectory.savedLocation(this)
@@ -68,6 +78,18 @@ public final class OfflineServer extends Service {
         return START_STICKY;
     }
 
+    private synchronized void stopBackend(int startId) {
+        stopping = true;
+        if (nodeChild != null) {
+            nodeChild.destroy();
+        } else if (nativeStarted) {
+            Process.sendSignal(Process.myPid(), android.system.OsConstants.SIGTERM);
+        } else if (worker == null) {
+            stopSelf(startId);
+            Process.killProcess(Process.myPid());
+        }
+    }
+
     private void startBackend(File cdn) {
         File root = getFilesDir();
         File runtime = new File(root, "offline-runtime");
@@ -84,16 +106,24 @@ public final class OfflineServer extends Service {
         settings.put("EMBEDDED_RUNTIME", "1");
         settings.put("ASSET_MODE", "local");
         settings.put("CN_LISTEN_HOST", "127.0.0.1");
-        settings.put("SESSION_HOST", "127.0.0.1");
-        settings.put("SESSION_PUBLIC_HOST", "127.0.0.1");
         settings.put("CDN_BASE_URL", "http://127.0.0.1:8001/patch/cn");
         File log = new File(root, BackendStartup.LOG_NAME);
         String entry = new File(runtime, "start.cjs").getPath();
         try {
+            String multiplayer;
+            try {
+                MultiplayerProfile profile = MultiplayerProfile.read(this);
+                multiplayer = profile.apply(settings, profile.mode == MultiplayerProfile.Mode.LAN_HOST
+                        ? MultiplayerProfile.localAddresses() : java.util.Collections.emptyList());
+            } catch (IOException error) {
+                MultiplayerProfile.offline().apply(settings, java.util.Collections.emptyList());
+                multiplayer = "单机。联机配置或网络接口无法读取，请检查联机设置。";
+            }
             settings.put("COMIC_DIR", ComicDirectory.prepare(this).getPath());
             try (PrintStream startup = new PrintStream(new FileOutputStream(log), true, "UTF-8")) {
                 startup.println("后端：直接读取 CDN " + CdnDirectory.validate(cdn));
                 startup.println("后端：加载 " + systemAbi + " 运行时");
+                startup.println("联机：" + multiplayer);
             }
             BackendStartup.report(root, startupRequest, "");
             Log.i("StarPoint", "Backend system ABI: " + systemAbi
@@ -105,7 +135,13 @@ public final class OfflineServer extends Service {
                 builder.environment().put("LD_LIBRARY_PATH", libraries.getPath());
                 builder.redirectErrorStream(true);
                 builder.redirectOutput(ProcessBuilder.Redirect.appendTo(log));
-                exit = builder.start().waitFor();
+                java.lang.Process child;
+                synchronized (this) {
+                    if (stopping) return;
+                    child = builder.start();
+                    nodeChild = child;
+                }
+                exit = child.waitFor();
             } else {
                 try (FileOutputStream output = new FileOutputStream(log, true)) {
                     android.system.Os.dup2(output.getFD(), 1);
@@ -115,11 +151,16 @@ public final class OfflineServer extends Service {
                     }
                     System.loadLibrary("node");
                     System.loadLibrary("starpoint_bridge");
+                    synchronized (this) {
+                        if (stopping) return;
+                        nativeStarted = true;
+                    }
                     exit = runNode(entry);
                 }
             }
-            throw new IOException("后端进程退出，退出码 " + exit + "。");
+            if (!stopping) throw new IOException("后端进程退出，退出码 " + exit + "。");
         } catch (Exception | LinkageError error) {
+            if (stopping) return;
             try (PrintStream diagnostics = new PrintStream(new FileOutputStream(log, true), true, "UTF-8")) {
                 error.printStackTrace(diagnostics);
             } catch (IOException ignored) {

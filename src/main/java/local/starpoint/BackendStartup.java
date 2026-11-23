@@ -1,5 +1,7 @@
 package local.starpoint;
 
+import android.app.ActivityManager;
+import android.content.Context;
 import android.util.Log;
 import java.io.File;
 import java.io.IOException;
@@ -11,11 +13,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.List;
 
 final class BackendStartup {
     static final String REQUEST = "startup-request";
     static final String CDN_DIRECTORY = "cdn-directory";
     static final String RESUME_GAME = "resume-game";
+    static final String STOP = "local.starpoint.STOP_LOCAL_BACKEND";
     static final String LOG_NAME = "backend.log";
     private static final String REPORT_NAME = "backend-startup.txt";
     private static final int MAX_LOG_BYTES = 12 * 1024;
@@ -79,5 +83,16 @@ final class BackendStartup {
         } finally {
             if (connection != null) connection.disconnect();
         }
+    }
+
+    static boolean hasServiceProcess(Context context) {
+        ActivityManager manager = context.getSystemService(ActivityManager.class);
+        List<ActivityManager.RunningAppProcessInfo> processes = manager == null ? null : manager.getRunningAppProcesses();
+        if (processes == null) return false;
+        String name = context.getPackageName() + ":starpoint";
+        for (ActivityManager.RunningAppProcessInfo process : processes) {
+            if (name.equals(process.processName)) return true;
+        }
+        return false;
     }
 }

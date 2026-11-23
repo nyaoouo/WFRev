@@ -398,7 +398,7 @@ ${pending ? `<dialog id="codeDialog" aria-labelledby="codeTitle">
     dialog.showModal();
   });
   authorize.addEventListener('click', () => {
-    title.textContent = '输入六位测试码';
+    title.textContent = '输入六位数字';
     authorize.hidden = true;
     codeEntry.hidden = false;
     keypad.querySelector('button').focus();

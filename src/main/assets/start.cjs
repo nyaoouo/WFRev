@@ -35,7 +35,12 @@ async function main() {
     }
     console.info("后端：启动 HTTP 服务")
     installComicPlaceholder(root)
+    require("./local-hub-endpoint.cjs").install(root)
     require("./local-payment.cjs").install(root)
+    require("./local-encyclopedia.cjs").install(root)
+    require("./local-team-recommendations.cjs").install(root)
+    const { buildCompanions } = require("./local-coop-companions.cjs").install(root)
+    require("./local-coop-requests.cjs").install(root, { buildCompanions })
     require(path.join(root, "out/cn-server.js"))
 }
 

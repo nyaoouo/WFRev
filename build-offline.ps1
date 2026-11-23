@@ -2,7 +2,10 @@ param(
     [switch]$RepackOnly,
     [switch]$ReuseRuntimeArchive,
     [string]$ToolchainDirectory,
-    [string]$ClientToolsDirectory
+    [string]$ClientToolsDirectory,
+    [string]$GitHubReleaseRepository,
+    [string]$SigningKeystore,
+    [string]$SigningKeyAlias = 'wf-local'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +31,27 @@ $addon = "$server/node_modules/better-sqlite3"
 $renameDependency = "$PSScriptRoot/rename-native-dependency.cjs"
 $gameSwf = 'worldflipper_android_release.swf'
 $overlay = "$build/overlay"
+$dist = "$PSScriptRoot/dist"
+$apkName = 'WorldFlipper-CN-Offline.apk'
+$releaseInfoName = 'starpoint-release.json'
+$releaseInfo = $null
+if ($GitHubReleaseRepository) {
+    if ($GitHubReleaseRepository -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$' -or
+        $GitHubReleaseRepository -match '/\.{1,2}$') {
+        throw 'Use -GitHubReleaseRepository owner/repo.'
+    }
+    $releaseInfo = [ordered]@{
+        schema = 1
+        repository = $GitHubReleaseRepository.ToLowerInvariant()
+        buildTimestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    }
+    $dist = "$dist/release"
+}
+$keystore = if ($SigningKeystore) { (Resolve-Path -LiteralPath $SigningKeystore).Path } else { "$client/local-test.jks" }
+if ($SigningKeystore -and [string]::IsNullOrEmpty($env:STARPOINT_SIGNING_STORE_PASSWORD)) {
+    throw 'Set STARPOINT_SIGNING_STORE_PASSWORD before using a signing keystore.'
+}
+if (!(Test-Path -LiteralPath $keystore -PathType Leaf)) { throw 'Signing keystore is missing.' }
 
 function Invoke-Tool($tool, [string[]]$arguments) {
     & $tool @arguments
@@ -151,9 +175,14 @@ if (!($application.provider | Where-Object { $_.GetAttribute('name', $android) -
     $provider.SetAttribute('exported', $android, 'false')
     [void]$application.AppendChild($provider)
 }
-if (!($application.activity | Where-Object { $_.GetAttribute('name', $android) -eq 'local.starpoint.PaymentCheckoutActivity' })) {
+$localWebActivities = @(
+    @{ Name = 'local.starpoint.PaymentCheckoutActivity'; Scheme = 'starpoint-checkout'; Host = 'order' }
+    @{ Name = 'local.starpoint.HistoryActivity'; Scheme = 'starpoint-history'; Host = 'open' }
+)
+foreach ($webActivity in $localWebActivities) {
+    if ($application.activity | Where-Object { $_.GetAttribute('name', $android) -eq $webActivity.Name }) { continue }
     $checkout = $manifest.CreateElement('activity')
-    [void]$checkout.SetAttribute('name', $android, 'local.starpoint.PaymentCheckoutActivity')
+    [void]$checkout.SetAttribute('name', $android, $webActivity.Name)
     [void]$checkout.SetAttribute('exported', $android, 'true')
     [void]$checkout.SetAttribute('screenOrientation', $android, 'portrait')
     [void]$checkout.SetAttribute('theme', $android, '@android:style/Theme.Material.Light.NoActionBar')
@@ -167,11 +196,19 @@ if (!($application.activity | Where-Object { $_.GetAttribute('name', $android) -
         [void]$filter.AppendChild($category)
     }
     $data = $manifest.CreateElement('data')
-    [void]$data.SetAttribute('scheme', $android, 'starpoint-checkout')
-    [void]$data.SetAttribute('host', $android, 'order')
+    [void]$data.SetAttribute('scheme', $android, $webActivity.Scheme)
+    [void]$data.SetAttribute('host', $android, $webActivity.Host)
     [void]$filter.AppendChild($data)
     [void]$checkout.AppendChild($filter)
     [void]$application.AppendChild($checkout)
+}
+if (!($application.activity | Where-Object { $_.GetAttribute('name', $android) -eq 'local.starpoint.MultiplayerSettings' })) {
+    $multiplayerSettings = $manifest.CreateElement('activity')
+    [void]$multiplayerSettings.SetAttribute('name', $android, 'local.starpoint.MultiplayerSettings')
+    [void]$multiplayerSettings.SetAttribute('exported', $android, 'false')
+    [void]$multiplayerSettings.SetAttribute('screenOrientation', $android, 'portrait')
+    [void]$multiplayerSettings.SetAttribute('theme', $android, '@android:style/Theme.Material.Light.NoActionBar')
+    [void]$application.AppendChild($multiplayerSettings)
 }
 if (!($application.activity | Where-Object { $_.GetAttribute('name', $android) -eq 'local.starpoint.OfflineEntry' })) {
     $entry = $manifest.CreateElement('activity')
@@ -234,6 +271,12 @@ $scriptArguments = @(
         '-C'; $decoded; "assets/starpoint/$($script.Name)"
     }
 )
+$releaseArguments = @()
+if ($null -ne $releaseInfo) {
+    New-Item -ItemType Directory -Force -Path "$overlay/assets/starpoint" | Out-Null
+    $releaseInfo | ConvertTo-Json -Compress | Set-Content -LiteralPath "$overlay/assets/starpoint/$releaseInfoName" -Encoding ascii
+    $releaseArguments = @('-C', $overlay, "assets/starpoint/$releaseInfoName")
+}
 
 Invoke-Tool "$javaBin/java.exe" @('-jar', "$resources/apktool_3.0.3.jar", 'b', '-p',
     "$resources/apktool-framework", '-o', "$build/offline-unsigned.apk", $decoded)
@@ -269,9 +312,28 @@ Invoke-Tool "$javaBin/jar.exe" @('u0f', $integrated, '-C', $overlay, "assets/$ga
 Invoke-Tool "$javaBin/jar.exe" (@('uf', $integrated,
     '-C', $overlay, 'AndroidManifest.xml',
     '-C', "$build/dex", 'classes.dex',
-    '-C', $decoded, 'assets/starpoint/runtime.zip') + $scriptArguments + $nativeArguments)
+    '-C', $decoded, 'assets/starpoint/runtime.zip') + $scriptArguments + $releaseArguments + $nativeArguments)
 Invoke-Tool "$buildTools/zipalign.exe" @('-p', '-f', '4', $integrated, "$build/offline-aligned.apk")
+$apkPath = "$dist/$apkName"
 & "$PSScriptRoot/publish-apk.ps1" -Java "$javaBin/java.exe" -Signer "$buildTools/lib/apksigner.jar" `
-    -Keystore "$client/local-test.jks" -AlignedApk "$build/offline-aligned.apk" `
-    -Destination "$PSScriptRoot/dist/WorldFlipper-CN-Offline.apk"
+    -Keystore $keystore -KeyAlias $SigningKeyAlias -UseEnvironmentPasswords:([bool]$SigningKeystore) `
+    -AlignedApk "$build/offline-aligned.apk" -Destination $apkPath
+if ($null -ne $releaseInfo) {
+    $releaseInfo['apkName'] = $apkName
+    $releaseInfo['apkBytes'] = (Get-Item -LiteralPath $apkPath).Length
+    $releaseInfo['sha256'] = (Get-FileHash -LiteralPath $apkPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $releaseInfoPath = "$dist/$releaseInfoName"
+    $stagedReleaseInfo = "$dist/release-info-$([guid]::NewGuid()).tmp"
+    try {
+        $releaseInfo | ConvertTo-Json | Set-Content -LiteralPath $stagedReleaseInfo -Encoding ascii
+        if ([IO.File]::Exists($releaseInfoPath)) {
+            [IO.File]::Replace($stagedReleaseInfo, $releaseInfoPath, [NullString]::Value)
+        } else {
+            [IO.File]::Move($stagedReleaseInfo, $releaseInfoPath)
+        }
+        Write-Output "Release metadata: $releaseInfoPath"
+    } finally {
+        [IO.File]::Delete($stagedReleaseInfo)
+    }
+}
 Remove-Item -LiteralPath "$build/offline-unsigned.apk", $integrated, "$build/offline-aligned.apk" -Force

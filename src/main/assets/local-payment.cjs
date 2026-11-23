@@ -4,6 +4,8 @@ const path = require("node:path")
 const { randomBytes } = require("node:crypto")
 const products = require("./payment-catalog.cjs")
 const { showCheckout } = require("./payment-page.cjs")
+const { installHistory } = require("./local-history.cjs")
+const { installQuotaAdmin } = require("./quota-admin.cjs")
 
 const api = "/api/index.php"
 const localCheckout = "/local/checkout/"
@@ -44,7 +46,8 @@ function install(root) {
                     product_id TEXT NOT NULL, period TEXT NOT NULL,
                     price INTEGER NOT NULL, expires_at INTEGER NOT NULL,
                     paid_at INTEGER, business_day TEXT, canceled INTEGER NOT NULL DEFAULT 0,
-                    acknowledged INTEGER NOT NULL DEFAULT 0
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
+                    quota_revision INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS local_payment_orders_player
                     ON local_payment_orders (player_id, product_id, period);
@@ -54,7 +57,15 @@ function install(root) {
                     delivered_through INTEGER NOT NULL, boost_day INTEGER,
                     activation_order_id TEXT, PRIMARY KEY(player_id, kind)
                 );
+                CREATE TABLE IF NOT EXISTS local_payment_quota_resets (
+                    player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+                    product_id TEXT NOT NULL, revision INTEGER NOT NULL, reset_period TEXT NOT NULL,
+                    PRIMARY KEY (player_id, product_id)
+                );
             `)
+            if (!current.pragma("table_info(local_payment_orders)").some(column => column.name === "quota_revision")) {
+                current.exec("ALTER TABLE local_payment_orders ADD COLUMN quota_revision INTEGER NOT NULL DEFAULT 0")
+            }
             const columns = current.pragma("table_info(local_payment_benefits)")
             if (!columns.some(column => column.name === "activation_order_id")) {
                 current.exec("ALTER TABLE local_payment_benefits ADD COLUMN activation_order_id TEXT")
@@ -123,19 +134,61 @@ function install(root) {
         return "archive"
     }
 
-    function countPaid(playerId, id, period) {
+    function quotaState(playerId, id) {
+        return db().prepare(`SELECT revision, reset_period FROM local_payment_quota_resets
+            WHERE player_id = ? AND product_id = ?`).get(playerId, id)
+    }
+
+    function countPaid(playerId, id, period, revision = quotaState(playerId, id)?.revision ?? 0) {
         if (period === undefined) {
             return db().prepare(`SELECT count(*) AS count FROM local_payment_orders
-                WHERE player_id = ? AND product_id = ? AND paid_at IS NOT NULL`).get(playerId, id).count
+                WHERE player_id = ? AND product_id = ? AND paid_at IS NOT NULL AND quota_revision = ?`).get(playerId, id, revision).count
         }
         return db().prepare(`SELECT count(*) AS count FROM local_payment_orders
-            WHERE player_id = ? AND product_id = ? AND period = ? AND paid_at IS NOT NULL`).get(playerId, id, period).count
+            WHERE player_id = ? AND product_id = ? AND period = ? AND paid_at IS NOT NULL AND quota_revision = ?`)
+            .get(playerId, id, period, revision).count
     }
 
     function purchasedTimes(playerId, id, product, period) {
         if (product.excludes && countPaid(playerId, product.excludes) > 0) return product.limit
-        if (product.period === "pass" && getPlayerPassCardStateSync(playerId, Number(period)).isBuy) return 1
-        return countPaid(playerId, id, period)
+        const quota = quotaState(playerId, id)
+        if (product.period === "pass" && quota?.reset_period !== period
+            && getPlayerPassCardStateSync(playerId, Number(period)).isBuy) return 1
+        return countPaid(playerId, id, period, quota?.revision ?? 0)
+    }
+
+    function listQuotas(playerId) {
+        const player = getPlayerSync(playerId)
+        if (!player) return null
+        const now = clock()
+        const offers = [...products].filter(([, product]) => product.limit).map(([id, product]) => {
+            const period = periodFor(product, now)
+            const used = period ? purchasedTimes(playerId, id, product, period) : null
+            return {
+                id, name: product.name, used, limit: product.limit, period,
+                kind: product.period ?? "archive", revision: quotaState(playerId, id)?.revision ?? 0,
+                paired: product.excludes ? products.get(product.excludes).name : null,
+            }
+        })
+        return { player: { id: playerId, name: player.name }, offers }
+    }
+
+    function resetQuota(playerId, id, expectedRevision, expectedPeriod) {
+        const product = products.get(id)
+        if (!product?.limit) return "invalid"
+        return db().transaction(() => {
+            if (!getPlayerSync(playerId)) return "missing"
+            const now = clock()
+            const period = periodFor(product, now)
+            if (!period || period !== expectedPeriod || (quotaState(playerId, id)?.revision ?? 0) !== expectedRevision) return "stale"
+            const advance = db().prepare(`INSERT INTO local_payment_quota_resets (player_id, product_id, revision, reset_period)
+                VALUES (?, ?, 1, ?) ON CONFLICT (player_id, product_id) DO UPDATE SET
+                    revision = revision + 1, reset_period = excluded.reset_period`)
+            // Orders keep their settled revision, so quota resets preserve history and benefits.
+            advance.run(playerId, id, period)
+            if (product.excludes) advance.run(playerId, product.excludes, periodFor(products.get(product.excludes), now))
+            return "ok"
+        })()
     }
 
     function grantMail(playerId, subject, [type, number, typeId], now) {
@@ -217,7 +270,7 @@ function install(root) {
     }
 
     const messages = {
-        paid: "模拟付款成功。返回游戏查看到账结果。",
+        paid: "付款成功。返回游戏查看到账结果。",
         canceled: "订单已取消。请返回游戏。",
         expired: "订单已过期。请返回游戏重新下单。",
         missing: "订单不存在。请从游戏商城重新下单。",
@@ -260,15 +313,18 @@ function install(root) {
                 if (eligible + product.price >= 30) extendBenefit(order.player_id, "dessert", now, order.id)
             }
             deliverBenefits(order.player_id, now)
-            db().prepare(`UPDATE local_payment_orders SET paid_at = ?, period = ?, business_day = ? WHERE id = ?`)
-                .run(now.real, period, now.key, id)
+            db().prepare(`UPDATE local_payment_orders SET paid_at = ?, period = ?, business_day = ?, quota_revision = ? WHERE id = ?`)
+                .run(now.real, period, now.key, quotaState(order.player_id, order.product_id)?.revision ?? 0, id)
             console.info(`[LOCAL-PAYMENT] paid ${order.product_id} for player ${order.player_id}`)
             return { state: "paid", message: messages.paid }
         })()
     }
 
+    installQuotaAdmin(root, listQuotas, resetQuota)
+    const registerHistory = installHistory(root, db, identity, products)
     const payment = load("routes/api/payment.js")
     payment.default = async fastify => {
+        registerHistory(fastify)
         fastify.post("/item_list", async (request, reply) => {
             const actor = identity(request.body)
             if (!actor) return reply.code(400).send({ error: "Invalid viewer ID" })
@@ -325,7 +381,11 @@ function install(root) {
             return response(reply, actor.viewerId, {
                 after_vmoney: player.vmoney, after_free_vmoney: player.freeVmoney,
                 first_payment: false, first_time: false,
-                purchased_times_list: { [productId]: purchasedTimes(actor.playerId, productId, product, periodFor(product, now) ?? order.period) },
+                purchased_times_list: Object.fromEntries([...products].flatMap(([id, offer]) => {
+                    const period = periodFor(offer, now)
+                    if (!period || (!offer.limit && id !== productId)) return []
+                    return [[id, purchasedTimes(actor.playerId, id, offer, period)]]
+                })),
                 monthly_payment_total: monthlyTotal(actor.playerId, now),
                 monthly_charge_bonus_info: !order.acknowledged && order.id === dessertActivationOrderId ? dessert : null,
                 premium_bonus_list: [{ remain_days: remain, store_product_id: monthProduct }],
@@ -352,7 +412,7 @@ function install(root) {
 
         fastify.post(`${localCheckout}:id/confirm`, { bodyLimit: 256 }, async (request, reply) => {
             if (typeof request.body?.code !== "string" || !/^[0-9]{6}$/.test(request.body.code)) {
-                return reply.code(400).send({ state: "pending", message: "请输入六位数字测试码。" })
+                return reply.code(400).send({ state: "pending", message: "请输入六位数字。" })
             }
             return settle(request.params.id, false)
         })

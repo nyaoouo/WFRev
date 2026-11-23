@@ -57,7 +57,7 @@ patchClass(localServer, handoff, "pinball.payment.gbits.GbitsAndroidRealPayment"
             Delay.delay(waitQuestPurchargeResult,1);
          } catch (error:Error) {
             curPurchargeInfo = null;
-            payment.failPurchase(PlatformPurchaseFailureReason.Msg("无法打开本地付款页。" + error.message));
+            payment.failPurchase(PlatformPurchaseFailureReason.Msg("无法打开付款页。" + error.message));
          }
       }
 
@@ -65,18 +65,79 @@ patchClass(localServer, handoff, "pinball.payment.gbits.GbitsAndroidRealPayment"
     replace("if(int(param1.status) != 3)", "".concat(
     "if (int(param1.status) == 4) {\n",
     "            curPurchargeInfo = null;\n",
-    "            payment.failPurchase(PlatformPurchaseFailureReason.UserCancel(\"本地订单已取消或过期。\"));\n",
+    "            payment.failPurchase(PlatformPurchaseFailureReason.UserCancel(\"订单已取消或过期。\"));\n",
     "            return;\n",
     "         }\n",
     "         if(int(param1.status) != 3)",
     ))
 })
 
-patchClass(handoff, destination, "pinball.remote.payment.finish.PaymentFinishRealRemote", (script, replace) => {
+const receipt = path.join(work, "payment-receipt.swf")
+patchClass(handoff, receipt, "pinball.remote.payment.finish.PaymentFinishRealRemote", (script, replace) => {
     const deviceStart = script.indexOf('var _loc6_:String = "none";')
     const requestStart = script.indexOf('startUserRequestDetail("payment/finish"', deviceStart)
     if (deviceStart < 0 || requestStart < 0) throw new Error("Payment SDK device lookup was not found")
     // The offline SDK returns no device JSON. The authenticated order is sufficient.
     replace(script.slice(deviceStart, requestStart), "var _loc16_:Object = {};\n         ")
     replace('"signature":param2.signature,', '"product_id":param2.itemId,\n               "signature":param2.signature,')
+})
+
+const menu = path.join(work, "history-menu.swf")
+patchClass(receipt, menu, "pinball.scene.menuTop.MenuTopScene", (_script, replace) => {
+    replace("import flash.net.URLRequest;", `import flash.net.URLRequest;
+   import flash.net.URLRequestMethod;
+   import flash.net.URLLoader;
+   import flash.events.Event;
+   import flash.events.IOErrorEvent;
+   import flash.events.SecurityErrorEvent;`)
+    replace("switch(param1.kind.index)", `if(param1.kind.index == 16 || param1.kind.index == 17)
+         {
+            openLocalHistory(param1.kind.index == 16 ? "payments" : "gacha");
+            return;
+         }
+         switch(param1.kind.index)`)
+    replace("public function createMenuListData()", `public function openLocalHistory(section:String) : void
+      {
+         var owner:MenuTopScene = this;
+         var request:URLRequest = new URLRequest("http://127.0.0.1:8001/api/index.php/payment/local/history/session");
+         request.method = URLRequestMethod.POST;
+         request.contentType = "application/json";
+         request.data = JSON.stringify({viewer_id:globalLogic.get_player().get_viewerId()});
+         var loader:URLLoader = new URLLoader();
+         var failed:Function = function(event:Event):void {
+            owner.showInstantMessage("暂时无法打开记录",InstantMessagePosition.Center);
+         };
+         loader.addEventListener(IOErrorEvent.IO_ERROR,failed);
+         loader.addEventListener(SecurityErrorEvent.SECURITY_ERROR,failed);
+         loader.addEventListener(Event.COMPLETE,function(event:Event):void {
+            var token:String = String(loader.data);
+            if(gear.isDisposed()) return;
+            if(!/^[a-f0-9]{48}$/.test(token)) {
+               failed(event);
+               return;
+            }
+            Lib.getURL(new URLRequest("starpoint-history://open/" + section + "/" + token));
+         });
+         try { loader.load(request); } catch(error:Error) { failed(null); }
+      }
+
+      public function createMenuListData()`)
+    // Place both records beside the existing receipt/history entry.
+    replace('"kind":MenuTopListItemKind.Item,', `"kind":{"index":16},
+            "content":MenuListContentKind.IconAndText("scene/general/sprite_sheet/vector_icon-assets/stone_large","local_payment_history")
+         },{
+            "kind":{"index":17},
+            "content":MenuListContentKind.IconAndText("scene/general/sprite_sheet/vector_icon-assets/history","local_gacha_history")
+         },{
+            "kind":MenuTopListItemKind.Item,`)
+})
+
+const menuLabels = path.join(work, "history-menu-labels.swf")
+patchClass(menu, menuLabels, "pinball.ui.component.list.menu.cell.MenuListCellContentView", (_script, replace) => {
+    replace(".set_text(view.asset.getUiString(param1));", `.set_text(param1 == "local_payment_history" ? "充值记录" :
+            param1 == "local_gacha_history" ? "扭蛋记录" : view.asset.getUiString(param1));`)
+})
+
+patchClass(menuLabels, destination, "pinball.ui.component.list.recentOtherPlayerParty.RecentOtherPlayerPartyListCellContentView", (_script, replace) => {
+    replace('view.asset.getUiString("recent_other_player_party_party_power_label")', '"推荐顺序"')
 })
